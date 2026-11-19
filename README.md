@@ -84,7 +84,7 @@
  
 ## Свои шаблоны
  
-В начале файла `windows.ahk` есть три переменные:
+В начале файла `HotKeys.ahk` есть три переменные:
  
 ```autohotkey
 global Snip1 := "your.email@example.com"
@@ -96,7 +96,7 @@ global Snip3 := "+7 900 000-00-00"
  
 ## Сборка .exe
  
-1. Открой папку со скриптом, правый клик по `windows.ahk`, затем **Compile Script**. Либо Пуск, затем AutoHotkey, затем **Convert .ahk to .exe**.
+1. Открой папку со скриптом, правый клик по `HotKeys.ahk`, затем **Compile Script**. Либо Пуск, затем AutoHotkey, затем **Convert .ahk to .exe**.
 2. В Ahk2Exe выбери Base File **Unicode 64-bit** (иначе русские буквы могут сломаться).
 3. Файл должен быть сохранён как **UTF-8 с BOM**.
 ## Известные особенности
