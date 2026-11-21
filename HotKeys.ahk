@@ -10,11 +10,24 @@ global TaskbarHidden := false
 global TaskbarHotkeyEnabled := false
 global DesktopsEnabled := true
 global GameMode := false
+global GamepadMode := false
 global CheatVisible := false
+
+; Состояние геймпад-режима
+global XInputFn := 0          ; адрес функции XInputGetState
+global GpPad := -1            ; номер найденного геймпада (0-3), -1 = нет
+global GpLeft := false        ; левая кнопка мыши зажата геймпадом
+global GpRight := false       ; правая кнопка мыши зажата геймпадом
+global GpPrev := 0            ; кнопки в прошлом опросе
+global GpFx := 0              ; дробный остаток движения по X
+global GpFy := 0              ; дробный остаток движения по Y
+global GpScroll := 0          ; накопленная прокрутка
+global GpRepeat := {}         ; таймеры автоповтора для крестовины
 
 global MenuTaskbar := "Enable Taskbar Hotkey (F12)"
 global MenuDesktops := "Enable Desktop Switching (CapsLock+1/2)"
 global MenuGame := "Game Mode (Ctrl+Alt+G)"
+global MenuGamepad := "Gamepad as mouse (Ctrl+Alt+M)"
 global MenuCheat := "Hotkey cheat sheet (CapsLock+H)"
 global MenuAutostart := "Run at Windows startup"
 
@@ -29,6 +42,7 @@ Menu, Tray, Tip, Hotkey Manager
 Menu, Tray, Add, %MenuTaskbar%, ToggleTaskbar
 Menu, Tray, Add, %MenuDesktops%, ToggleDesktops
 Menu, Tray, Add, %MenuGame%, ToggleGameMode
+Menu, Tray, Add, %MenuGamepad%, ToggleGamepad
 Menu, Tray, Add
 Menu, Tray, Add, %MenuCheat%, ShowCheat
 Menu, Tray, Add, %MenuAutostart%, ToggleAutostart
@@ -62,6 +76,23 @@ ToggleGameMode:
     Notify("Game mode", GameMode)
 return
 
+ToggleGamepad:
+    GamepadMode := !GamepadMode
+    if (GamepadMode) {
+        GamepadInit()
+        SetTimer, GamepadTick, 15
+    } else {
+        SetTimer, GamepadTick, Off
+        GamepadRelease()
+    }
+    UpdateMenu()
+    Notify("Gamepad mouse", GamepadMode)
+return
+
+GamepadTick:
+    GamepadPoll()
+return
+
 ShowCheat:
     ShowCheatSheet()
 return
@@ -91,6 +122,9 @@ return
 
 ; Ctrl+Alt+G - игровой режим (работает всегда, в том числе чтобы его выключить)
 ^!g::Gosub, ToggleGameMode
+
+; Ctrl+Alt+M - геймпад как мышь (вкл / выкл)
+^!m::Gosub, ToggleGamepad
 
 #If TaskbarHotkeyEnabled
 F12::SetTaskbar(TaskbarHidden)        ; скрыта - показать, видна - скрыть
@@ -157,6 +191,18 @@ CapsLock & SC022::SearchSelected("https://www.google.com/search?q={q}")         
 CapsLock & SC015::SearchSelected("https://yandex.ru/search/?text={q}")            ; Y - Яндекс
 CapsLock & SC02D::SearchSelected("https://translate.google.com/?sl=auto&tl=ru&op=translate&text={q}")  ; X - перевод
 
+; --- Курсор с клавиатуры (если мышь не работает) ---
+; Держишь CapsLock + I/J/K/L: курсор едет, чем дольше держишь, тем быстрее.
+; Короткое нажатие двигает курсор на пару пикселей (точная подстройка).
+CapsLock & SC017::MouseNav()                       ; I - вверх
+CapsLock & SC024::MouseNav()                       ; J - влево
+CapsLock & SC025::MouseNav()                       ; K - вниз
+CapsLock & SC026::MouseNav()                       ; L - вправо
+CapsLock & SC016::MouseButton("Left", "SC016")     ; U - левая кнопка (удержание = перетаскивание)
+CapsLock & SC018::MouseButton("Right", "SC018")    ; O - правая кнопка
+CapsLock & SC033::Click, WheelUp                   ; , - прокрутка вверх
+CapsLock & SC034::Click, WheelDown                 ; . - прокрутка вниз
+
 ; --- Шпаргалка ---
 CapsLock & SC023::ShowCheatSheet()                 ; H - показать / скрыть
 
@@ -170,6 +216,8 @@ UpdateMenu() {
     Menu, Tray, %act%, %MenuDesktops%
     act := GameMode ? "Check" : "Uncheck"
     Menu, Tray, %act%, %MenuGame%
+    act := GamepadMode ? "Check" : "Uncheck"
+    Menu, Tray, %act%, %MenuGamepad%
     lnk := A_Startup "\" . RegExReplace(A_ScriptName, "\.ahk$") . ".lnk"
     act := FileExist(lnk) ? "Check" : "Uncheck"
     Menu, Tray, %act%, %MenuAutostart%
@@ -247,6 +295,203 @@ SnapWindow(xp, yp, wp, hp) {
     aw := mRight - mLeft
     ah := mBottom - mTop
     WinMove, ahk_id %hwnd%, , Round(mLeft + aw * xp), Round(mTop + ah * yp), Round(aw * wp), Round(ah * hp)
+}
+
+; ===== ГЕЙМПАД КАК МЫШЬ (XInput) =====
+; Геймпад Xbox читается напрямую через xinput*.dll, без сторонних библиотек.
+; Пока режим включён, таймер GamepadTick опрашивает его каждые 15 мс.
+;   левый стик - курсор (LB зажат = точный режим), правый стик - прокрутка
+;   A или RT - левая кнопка (удержание = перетаскивание), B или LT - правая
+;   X - Enter, Y - экранная клавиатура, Back - Esc, Start - клавиша Win
+;   крестовина - стрелки (с автоповтором)
+;   LB + RB + нажатие обоих стиков - выключить режим
+
+GamepadInit() {
+    global XInputFn, GpPad
+    GpPad := -1
+    if (XInputFn)
+        return
+    for i, dll in ["xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"] {
+        lib := DllCall("LoadLibrary", "Str", dll, "Ptr")
+        if (lib) {
+            XInputFn := DllCall("GetProcAddress", "Ptr", lib, "AStr", "XInputGetState", "Ptr")
+            if (XInputFn)
+                break
+        }
+    }
+    if (!XInputFn)
+        TrayTip, Gamepad, XInput not found, 3, 0x10
+}
+
+; Нормализованное значение стика: мёртвая зона + мягкая кривая, знак сохраняется
+GpAxis(v) {
+    dz := 7849
+    if (Abs(v) < dz)
+        return 0
+    n := (Abs(v) - dz) / (32767 - dz)
+    if (n > 1)
+        n := 1
+    n := n * n
+    return (v < 0) ? -n : n
+}
+
+MouseEv(flags, data := 0) {
+    DllCall("mouse_event", "UInt", flags, "UInt", 0, "UInt", 0, "Int", data, "UPtr", 0)
+}
+
+; Отпускаем всё, что геймпад мог зажать (при выключении, отключении, игровом режиме)
+GamepadRelease() {
+    global GpLeft, GpRight, GpPrev
+    if (GpLeft) {
+        MouseEv(0x4)
+        GpLeft := false
+    }
+    if (GpRight) {
+        MouseEv(0x10)
+        GpRight := false
+    }
+    GpPrev := 0
+}
+
+GamepadPoll() {
+    global XInputFn, GpPad, GameMode, GpLeft, GpRight, GpPrev, GpFx, GpFy, GpScroll, GpRepeat
+    static lastScan := 0
+
+    ; в игровом режиме геймпад не трогаем
+    if (!XInputFn || GameMode) {
+        GamepadRelease()
+        return
+    }
+
+    VarSetCapacity(state, 16, 0)
+
+    ; ищем подключённый геймпад (раз в секунду, чтобы не грузить систему)
+    if (GpPad < 0) {
+        if (A_TickCount - lastScan < 1000)
+            return
+        lastScan := A_TickCount
+        Loop, 4 {
+            if (DllCall(XInputFn, "UInt", A_Index - 1, "Ptr", &state, "UInt") = 0) {
+                GpPad := A_Index - 1
+                break
+            }
+        }
+        if (GpPad < 0)
+            return
+    }
+    if (DllCall(XInputFn, "UInt", GpPad, "Ptr", &state, "UInt") != 0) {
+        GpPad := -1
+        GamepadRelease()
+        return
+    }
+
+    btn := NumGet(state, 4, "UShort")
+    lt := NumGet(state, 6, "UChar")
+    rt := NumGet(state, 7, "UChar")
+    lx := NumGet(state, 8, "Short")
+    ly := NumGet(state, 10, "Short")
+    ry := NumGet(state, 14, "Short")
+
+    ; LB + RB + нажатие обоих стиков - выключить режим
+    if ((btn & 0x3C0) = 0x3C0) {
+        Gosub, ToggleGamepad
+        return
+    }
+
+    ; левый стик - курсор (дробный остаток копим, чтобы слабый наклон тоже двигал)
+    mx := GpAxis(lx)
+    my := GpAxis(ly)
+    if (mx != 0 || my != 0) {
+        speed := (btn & 0x100) ? 5 : 18
+        GpFx += mx * speed
+        GpFy -= my * speed
+        dx := ((GpFx < 0) ? -1 : 1) * Floor(Abs(GpFx))
+        dy := ((GpFy < 0) ? -1 : 1) * Floor(Abs(GpFy))
+        if (dx != 0 || dy != 0) {
+            MouseMove, % dx, % dy, 0, R
+            GpFx -= dx
+            GpFy -= dy
+        }
+    } else {
+        GpFx := 0
+        GpFy := 0
+    }
+
+    ; правый стик по вертикали - прокрутка
+    ryn := GpAxis(ry)
+    if (ryn != 0) {
+        GpScroll += ryn * 25
+        notches := Floor(Abs(GpScroll) / 120)
+        if (notches > 0) {
+            sgn := (GpScroll < 0) ? -1 : 1
+            MouseEv(0x800, sgn * notches * 120)
+            GpScroll -= sgn * notches * 120
+        }
+    } else {
+        GpScroll := 0
+    }
+
+    ; кнопки мыши: A / RT - левая, B / LT - правая
+    left := ((btn & 0x1000) || rt > 100) ? true : false
+    right := ((btn & 0x2000) || lt > 100) ? true : false
+    if (left != GpLeft) {
+        MouseEv(left ? 0x2 : 0x4)
+        GpLeft := left
+    }
+    if (right != GpRight) {
+        MouseEv(right ? 0x8 : 0x10)
+        GpRight := right
+    }
+
+    ; одноразовые действия - только в момент нажатия
+    pressed := btn & ~GpPrev
+    GpPrev := btn
+    if (pressed & 0x4000)
+        Send, {Enter}
+    if (pressed & 0x8000)
+        Run, osk.exe
+    if (pressed & 0x20)
+        Send, {Esc}
+    if (pressed & 0x10)
+        Send, {LWin}
+
+    ; крестовина - стрелки: сразу при нажатии, потом автоповтор
+    for i, d in [[0x1, "Up"], [0x2, "Down"], [0x4, "Left"], [0x8, "Right"]] {
+        if (btn & d[1]) {
+            if (pressed & d[1]) {
+                Send, % "{" d[2] "}"
+                GpRepeat[d[2]] := A_TickCount + 400
+            } else if (A_TickCount >= GpRepeat[d[2]]) {
+                Send, % "{" d[2] "}"
+                GpRepeat[d[2]] := A_TickCount + 70
+            }
+        }
+    }
+}
+
+; Движение курсора клавишами I/J/K/L (с CapsLock). Цикл крутится, пока клавиши
+; зажаты, поэтому можно держать две сразу (диагональ). Скорость растёт со временем.
+MouseNav() {
+    static running := false
+    if (running)
+        return
+    running := true
+    start := A_TickCount
+    while (GetKeyState("CapsLock", "P") && (GetKeyState("SC017", "P") || GetKeyState("SC024", "P") || GetKeyState("SC025", "P") || GetKeyState("SC026", "P"))) {
+        dx := (GetKeyState("SC026", "P") ? 1 : 0) - (GetKeyState("SC024", "P") ? 1 : 0)
+        dy := (GetKeyState("SC025", "P") ? 1 : 0) - (GetKeyState("SC017", "P") ? 1 : 0)
+        step := Min(3 + (A_TickCount - start) // 60, 25)
+        MouseMove, % dx * step, % dy * step, 0, R
+        Sleep, 15
+    }
+    running := false
+}
+
+; Клик кнопкой мыши: пока клавиша зажата, кнопка удерживается (перетаскивание)
+MouseButton(btn, key) {
+    Click, %btn% Down
+    KeyWait, %key%
+    Click, %btn% Up
 }
 
 ; Прозрачность активного окна: delta > 0 плотнее, delta < 0 прозрачнее
@@ -369,10 +614,16 @@ ShowCheatSheet() {
     3 / 4 / 5      вставить шаблон 1 / 2 / 3
     Space          исправить раскладку выделенного
     G / Y / X      Google / Яндекс / перевод выделенного
+    I J K L        курсор мыши (держи, разгоняется)
+    U / O          левая / правая кнопка мыши
+    , / .          прокрутка вверх / вниз
     H              эта шпаргалка
     ------------------------------------------
     Shift+CapsLock обычный CapsLock
     Ctrl+Alt+G     игровой режим
+    Ctrl+Alt+M     геймпад как мышь вкл / выкл
+                   стик - курсор, A/RT - левый клик, B/LT - правый,
+                   пр. стик - прокрутка, Y - экранная клавиатура
     Win+F12        режим скрытия панели задач (потом F12)
     )
     CheatVisible := true
