@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.event.release.tag_name }}
 
@@ -64,10 +64,17 @@ jobs:
             throw 'HotKeys.ahk was not found in the repository root.'
           }
 
+          Remove-Item $output -Force -ErrorAction SilentlyContinue
           & $env:AHK_COMPILER /in $source /out $output /bin $env:AHK_BASE
 
+          # Ahk2Exe may finish writing the EXE shortly after it reports completion.
+          $timeout = (Get-Date).AddSeconds(30)
+          while (-not (Test-Path $output) -and (Get-Date) -lt $timeout) {
+            Start-Sleep -Milliseconds 500
+          }
+
           if (-not (Test-Path $output)) {
-            throw 'Compilation failed: HotKeys.exe was not created.'
+            throw 'Compilation failed: HotKeys.exe was not created within 30 seconds.'
           }
 
           $exe = Get-Item $output
