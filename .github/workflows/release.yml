@@ -1,0 +1,71 @@
+name: Build HotKeys EXE
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Compile AutoHotkey v1 script
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download AutoHotkey v1.1.37.02
+        shell: pwsh
+        run: |
+          $zipPath = Join-Path $env:RUNNER_TEMP 'AutoHotkey_1.1.37.02.zip'
+          $extractPath = Join-Path $env:RUNNER_TEMP 'AutoHotkey'
+          $url = 'https://github.com/AutoHotkey/AutoHotkey/releases/download/v1.1.37.02/AutoHotkey_1.1.37.02.zip'
+
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
+          $expectedHash = '6F3663F7CDD25063C8C8728F5D9B07813CED8780522FD1F124BA539E2854215F'
+          if ($actualHash -ne $expectedHash) {
+            throw "AutoHotkey archive checksum mismatch: $actualHash"
+          }
+
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+          $compiler = Get-ChildItem -Path $extractPath -Filter 'Ahk2Exe.exe' -Recurse |
+            Select-Object -First 1
+          $base = Get-ChildItem -Path $extractPath -Filter 'AutoHotkeyU64.exe' -Recurse |
+            Select-Object -First 1
+
+          if (-not $compiler) { throw 'Ahk2Exe.exe was not found in the AutoHotkey archive.' }
+          if (-not $base) { throw 'AutoHotkeyU64.exe was not found in the AutoHotkey archive.' }
+
+          "AHK_COMPILER=$($compiler.FullName)" >> $env:GITHUB_ENV
+          "AHK_BASE=$($base.FullName)" >> $env:GITHUB_ENV
+
+      - name: Compile HotKeys.ahk
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:GITHUB_WORKSPACE 'HotKeys.ahk'
+          $output = Join-Path $env:GITHUB_WORKSPACE 'HotKeys.exe'
+
+          if (-not (Test-Path $source)) {
+            throw 'HotKeys.ahk was not found in the repository root.'
+          }
+
+          & $env:AHK_COMPILER /in $source /out $output /bin $env:AHK_BASE
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ahk2Exe failed with exit code $LASTEXITCODE."
+          }
+          if (-not (Test-Path $output)) {
+            throw 'Compilation finished without producing HotKeys.exe.'
+          }
+
+          Get-Item $output | Format-List Name, Length
+
+      - name: Upload EXE to the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$env:GITHUB_REF_NAME" "$env:GITHUB_WORKSPACE\HotKeys.exe" --clobber
