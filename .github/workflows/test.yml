@@ -1,0 +1,48 @@
+name: Windows scenario tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.windows }}
+    strategy:
+      fail-fast: false
+      matrix:
+        windows:
+          - windows-2022
+          - windows-2025
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install AutoHotkey v1.1
+        shell: pwsh
+        run: |
+          $url = "https://github.com/AutoHotkey/AutoHotkey/releases/download/v1.1.37.02/AutoHotkey_1.1.37.02.zip"
+          Invoke-WebRequest $url -OutFile ahk.zip
+          Expand-Archive ahk.zip ahk -Force
+          "AHK_PATH=$((Resolve-Path ahk).Path)\AutoHotkeyU64.exe" |
+            Out-File $env:GITHUB_ENV -Append
+
+      - name: Compile script
+        shell: pwsh
+        run: |
+          & (Get-ChildItem ahk -Recurse -Filter Ahk2Exe.exe |
+            Select-Object -First 1).FullName `
+            /in HotKeys.ahk `
+            /out HotKeys.exe `
+            /bin "$env:GITHUB_WORKSPACE\ahk\AutoHotkeyU64.exe"
+
+      - name: Test script startup
+        shell: pwsh
+        run: |
+          Start-Process .\HotKeys.exe
+          Start-Sleep 3
+          Get-Process HotKeys -ErrorAction Stop
+          Stop-Process -Name HotKeys
