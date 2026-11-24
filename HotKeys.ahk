@@ -2,6 +2,17 @@
 #SingleInstance Force
 FileEncoding, UTF-8
 
+; --- ПРАВА АДМИНИСТРАТОРА ---
+; Без них скрипт не работает в окнах, запущенных от администратора (Диспетчер устройств,
+; диспетчер задач, часть установщиков). При запуске сам просит права (окно UAC) и перезапускается.
+; Если отказаться в окне UAC, скрипт продолжит работу без прав администратора.
+if (!A_IsAdmin) {
+    try {
+        Run, *RunAs "%A_ScriptFullPath%"
+        ExitApp
+    }
+}
+
 ; ВАЖНО: файл должен быть сохранён как UTF-8 с BOM, иначе русские буквы
 ; в строках (шаблоны, раскладка) превратятся в кракозябры.
 
@@ -17,11 +28,17 @@ global CheatVisible := false
 global XInputFn := 0          ; адрес функции XInputGetState
 global GpPad := -1            ; номер найденного геймпада (0-3), -1 = нет
 global GpLeft := false        ; левая кнопка мыши зажата геймпадом
+global GpMiddle := false        ; средняя кнопка мыши зажата геймпадом
 global GpRight := false       ; правая кнопка мыши зажата геймпадом
 global GpPrev := 0            ; кнопки в прошлом опросе
 global GpFx := 0              ; дробный остаток движения по X
 global GpFy := 0              ; дробный остаток движения по Y
 global GpScroll := 0          ; накопленная прокрутка
+global GpAltTab := false      ; открыт переключатель окон (Alt зажат программно)
+global GpAltTabLast := 0      ; время последнего нажатия в переключателе
+global AltTabIdleMs := 2000   ; через сколько мс бездействия переключатель сам выберет окно
+global GpComboStart := 0      ; когда начали держать оба стика (для выключения режима)
+global GpBlock := 0           ; кнопки, которые игнорируем до отпускания (после выбора окна)
 global GpRepeat := {}         ; таймеры автоповтора для крестовины
 
 global MenuTaskbar := "Enable Taskbar Hotkey (F12)"
@@ -92,6 +109,7 @@ return
 GamepadTick:
     GamepadPoll()
 return
+
 
 ShowCheat:
     ShowCheatSheet()
@@ -200,6 +218,7 @@ CapsLock & SC025::MouseNav()                       ; K - вниз
 CapsLock & SC026::MouseNav()                       ; L - вправо
 CapsLock & SC016::MouseButton("Left", "SC016")     ; U - левая кнопка (удержание = перетаскивание)
 CapsLock & SC018::MouseButton("Right", "SC018")    ; O - правая кнопка
+CapsLock & SC019::MouseButton("Middle", "SC019")   ; P - средняя кнопка (колёсико)
 CapsLock & SC033::Click, WheelUp                   ; , - прокрутка вверх
 CapsLock & SC034::Click, WheelDown                 ; . - прокрутка вниз
 
@@ -300,11 +319,14 @@ SnapWindow(xp, yp, wp, hp) {
 ; ===== ГЕЙМПАД КАК МЫШЬ (XInput) =====
 ; Геймпад Xbox читается напрямую через xinput*.dll, без сторонних библиотек.
 ; Пока режим включён, таймер GamepadTick опрашивает его каждые 15 мс.
-;   левый стик - курсор (LB зажат = точный режим), правый стик - прокрутка
+;   левый стик - курсор, правый стик - прокрутка
 ;   A или RT - левая кнопка (удержание = перетаскивание), B или LT - правая
 ;   X - Enter, Y - экранная клавиатура, Back - Esc, Start - клавиша Win
 ;   крестовина - стрелки (с автоповтором)
-;   LB + RB + нажатие обоих стиков - выключить режим
+;   RB - переключатель окон (Alt+Tab): RB / LB листают вперёд / назад, A - выбрать,
+;        B - отмена, сам выберет окно после 2 секунд бездействия
+;   LB - назад (кнопка «Назад» в браузере и проводнике; при открытом Alt+Tab листает назад)
+;   зажать оба стика (L3 + R3) на секунду - выключить режим
 
 GamepadInit() {
     global XInputFn, GpPad
@@ -339,9 +361,35 @@ MouseEv(flags, data := 0) {
     DllCall("mouse_event", "UInt", flags, "UInt", 0, "UInt", 0, "Int", data, "UPtr", 0)
 }
 
+; Alt+Tab с геймпада: первое нажатие RB зажимает Alt и открывает переключатель окон,
+; дальше RB / LB листают вперёд / назад, A выбирает, B отменяет, а при бездействии
+; (AltTabIdleMs) выбор подтверждается сам.
+AltTabStep(dir) {
+    global GpAltTab, GpAltTabLast
+    if (!GpAltTab) {
+        Send, {Alt down}
+        GpAltTab := true
+    }
+    if (dir > 0)
+        Send, {Tab}
+    else
+        Send, +{Tab}
+    GpAltTabLast := A_TickCount
+}
+
+AltTabEnd(confirm) {
+    global GpAltTab
+    if (!GpAltTab)
+        return
+    if (!confirm)
+        Send, {Esc}
+    Send, {Alt up}
+    GpAltTab := false
+}
+
 ; Отпускаем всё, что геймпад мог зажать (при выключении, отключении, игровом режиме)
 GamepadRelease() {
-    global GpLeft, GpRight, GpPrev
+    global GpLeft, GpRight, GpMiddle, GpPrev, GpAltTab, GpBlock
     if (GpLeft) {
         MouseEv(0x4)
         GpLeft := false
@@ -350,11 +398,21 @@ GamepadRelease() {
         MouseEv(0x10)
         GpRight := false
     }
+    if (GpMiddle) {
+        MouseEv(0x40)
+        GpMiddle := false
+    }
+    if (GpAltTab) {
+        Send, {Esc}{Alt up}
+        GpAltTab := false
+    }
+    GpBlock := 0
     GpPrev := 0
 }
 
 GamepadPoll() {
-    global XInputFn, GpPad, GameMode, GpLeft, GpRight, GpPrev, GpFx, GpFy, GpScroll, GpRepeat
+    global XInputFn, GpPad, GameMode, GpLeft, GpRight, GpMiddle, GpPrev, GpFx, GpFy, GpScroll, GpRepeat
+    global GpAltTab, GpAltTabLast, AltTabIdleMs, GpBlock, GpComboStart
     static lastScan := 0
 
     ; в игровом режиме геймпад не трогаем
@@ -392,9 +450,48 @@ GamepadPoll() {
     ly := NumGet(state, 10, "Short")
     ry := NumGet(state, 14, "Short")
 
-    ; LB + RB + нажатие обоих стиков - выключить режим
-    if ((btn & 0x3C0) = 0x3C0) {
-        Gosub, ToggleGamepad
+    ; кнопки, которыми только что выбрали окно, игнорируем, пока их не отпустят
+    GpBlock := GpBlock & btn
+    btn := btn & ~GpBlock
+
+    ; оба стика (L3 + R3) зажаты секунду - выключить режим
+    if ((btn & 0xC0) = 0xC0) {
+        if (!GpComboStart) {
+            GpComboStart := A_TickCount
+        } else if (A_TickCount - GpComboStart > 1000) {
+            GpComboStart := 0
+            Gosub, ToggleGamepad
+            return
+        }
+    } else {
+        GpComboStart := 0
+    }
+
+    ; новые нажатия (кнопки, нажатые именно сейчас)
+    pressed := btn & ~GpPrev
+    GpPrev := btn
+
+    ; переключатель окон (Alt+Tab): пока он открыт, кнопки работают только на него
+    if (GpAltTab && A_TickCount - GpAltTabLast > AltTabIdleMs)
+        AltTabEnd(true)
+    if (GpAltTab) {
+        if (pressed & 0x200)
+            AltTabStep(1)
+        else if (pressed & 0x100)
+            AltTabStep(-1)
+        if (pressed & 0x1000) {
+            AltTabEnd(true)
+            GpBlock |= 0x1000
+        } else if (pressed & 0x2000) {
+            AltTabEnd(false)
+            GpBlock |= 0x2000
+        }
+        for i, d in [[0x1, "Up"], [0x2, "Down"], [0x4, "Left"], [0x8, "Right"]] {
+            if (pressed & d[1]) {
+                Send, % "{" d[2] "}"
+                GpAltTabLast := A_TickCount
+            }
+        }
         return
     }
 
@@ -402,7 +499,7 @@ GamepadPoll() {
     mx := GpAxis(lx)
     my := GpAxis(ly)
     if (mx != 0 || my != 0) {
-        speed := (btn & 0x100) ? 5 : 18
+        speed := 18
         GpFx += mx * speed
         GpFy -= my * speed
         dx := ((GpFx < 0) ? -1 : 1) * Floor(Abs(GpFx))
@@ -442,10 +539,18 @@ GamepadPoll() {
         MouseEv(right ? 0x8 : 0x10)
         GpRight := right
     }
+    ; нажатие правого стика (R3) - средняя кнопка
+    middle := ((btn & 0x80) && !(btn & 0x40)) ? true : false
+    if (middle != GpMiddle) {
+        MouseEv(middle ? 0x20 : 0x40)
+        GpMiddle := middle
+    }
 
     ; одноразовые действия - только в момент нажатия
-    pressed := btn & ~GpPrev
-    GpPrev := btn
+    if (pressed & 0x200)
+        AltTabStep(1)
+    if (pressed & 0x100)
+        Send, {Browser_Back}
     if (pressed & 0x4000)
         Send, {Enter}
     if (pressed & 0x8000)
@@ -617,13 +722,16 @@ ShowCheatSheet() {
     I J K L        курсор мыши (держи, разгоняется)
     U / O          левая / правая кнопка мыши
     , / .          прокрутка вверх / вниз
+    P              средняя кнопка мыши (колёсико)
     H              эта шпаргалка
     ------------------------------------------
     Shift+CapsLock обычный CapsLock
     Ctrl+Alt+G     игровой режим
     Ctrl+Alt+M     геймпад как мышь вкл / выкл
                    стик - курсор, A/RT - левый клик, B/LT - правый,
-                   пр. стик - прокрутка, Y - экранная клавиатура
+                   пр. стик - прокрутка, нажатие пр. стика - средняя кнопка,
+                   Y - экранная клавиатура, X - Enter,
+                   RB - окна (Alt+Tab), A - выбрать, B - отмена, LB - назад
     Win+F12        режим скрытия панели задач (потом F12)
     )
     CheatVisible := true
